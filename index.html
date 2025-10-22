@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="tl">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Lua Analyzer / Deobfuscation Helper — Argian</title>
+<style>
+:root{--bg:#071019;--panel:#0b1720;--muted:#9fb6a6;--accent:#2ea043}
+body{background:var(--bg);color:#e6f3ea;font-family:system-ui,Arial;margin:12px}
+.wrap{max-width:1100px;margin:0 auto}
+.card{background:var(--panel);padding:12px;border-radius:10px;border:1px solid #072;margin-bottom:12px}
+textarea{width:100%;height:260px;background:#04121a;color:#dfffdc;border-radius:8px;padding:10px;font-family:monospace;resize:vertical}
+input[type=text]{width:100%;padding:8px;border-radius:6px;border:1px solid #123;background:#021018;color:#dff}
+.grid{display:flex;gap:8px;flex-wrap:wrap}
+label{display:inline-flex;align-items:center;gap:8px}
+button{background:var(--accent);color:#001;padding:9px 12px;border-radius:8px;border:0;cursor:pointer;font-weight:700}
+.smallbtn{background:#0b2a23;color:#bff;padding:6px 8px;border-radius:6px;border:0;cursor:pointer}
+pre{white-space:pre-wrap;background:#02121a;padding:12px;border-radius:8px;color:#bfeacb;overflow:auto}
+.muted{color:var(--muted);font-size:13px}
+.warn{color:#ffb3b3}
+.ok{color:#bfffc7}
+kbd{background:#062226;padding:2px 6px;border-radius:4px}
+@media(max-width:720px){ .grid{flex-direction:column} }
+a.link{color:#7fd1ff}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Lua Analyzer / Deobfuscation Helper</h1>
+  <p class="muted">Safe, client-side text transforms & analysis — <strong>hindi</strong> ito gumagawa ng full bypass ng proprietary protectors. Para sa auditing at edukasyon.</p>
+
+  <div class="card">
+    <label class="muted">GitHub raw URL (optional)</label>
+    <input id="rawUrl" placeholder="https://raw.githubusercontent.com/user/repo/main/file.lua" />
+    <div style="margin-top:8px" class="grid">
+      <div style="flex:1">
+        <label class="muted">Upload .lua file</label><br>
+        <input id="fileInput" type="file" accept=".lua,text/*" />
+      </div>
+      <div style="width:140px">
+        <label class="muted">Fetch</label><br>
+        <button id="fetchBtn" class="smallbtn">Fetch URL</button>
+      </div>
+    </div>
+
+    <div style="margin-top:8px">
+      <label class="muted">Or paste obfuscated Lua here</label>
+      <textarea id="input" placeholder="I-paste ang buong Lua code dito..."></textarea>
+    </div>
+
+    <div style="margin-top:8px" class="grid">
+      <label><input type="checkbox" id="optChar" checked> Rebuild <code>string.char(...)</code></label>
+      <label><input type="checkbox" id="optConcatChar" checked> Handle concatenated string.char()</label>
+      <label><input type="checkbox" id="optOctal" checked> Unescape octal (e.g. \123)</label>
+      <label><input type="checkbox" id="optUnicode" checked> Unescape \x.. / \u.. sequences</label>
+      <label><input type="checkbox" id="optB64" checked> Try base64</label>
+      <label><input type="checkbox" id="optHex"> Try hex decode</label>
+      <label><input type="checkbox" id="optUrlDecode"> Try URL decode</label>
+      <label><input type="checkbox" id="optRot" > Try ROT13/47</label>
+      <label><input type="checkbox" id="optXor"> Try single-byte XOR brute (small blobs)</label>
+      <label><input type="checkbox" id="optReplaceLoad" checked> Replace decoded inside load/loadstring</label>
+      <label><input type="checkbox" id="optIter"> Iterative passes (multi-layer)</label>
+    </div>
+
+    <div style="margin-top:10px" class="grid">
+      <button id="deobBtn">Deobfuscate / Analyze</button>
+      <button id="clearBtn" class="smallbtn">Clear</button>
+      <button id="copyBtn" class="smallbtn">Copy Result</button>
+      <button id="dlBtn" class="smallbtn">Download .txt</button>
+    </div>
+
+    <div style="margin-top:8px" class="muted">
+      Tests:
+      <button id="testA" class="smallbtn">Base64 in load</button>
+      <button id="testB" class="smallbtn">string.char</button>
+      <button id="testC" class="smallbtn">Octal</button>
+    </div>
+  </div>
+
+  <div id="results"></div>
+</div>
+
+<script>
+/* ---------------- Utilities ---------------- */
+const el = id => document.getElementById(id);
+function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function downloadFile(name, content){ const a=document.createElement('a'); a.href='data:text/plain;charset=utf-8,'+encodeURIComponent(content); a.download=name; a.click(); }
+
+/* safe atob tolerant */
+function safeAtob(s){
+  try{
+    s = s.replace(/\\s+/g,'');
+    const pad = s.length % 4;
+    if(pad) s += '='.repeat(4-pad);
+    return atob(s);
+  }catch(e){
+    try{ return decodeURIComponent(escape(window.atob(s))); }catch(e2){}
+    return null;
+  }
+}
+
+/* URL decode safely */
+function safeUrlDecode(s){
+  try{ return decodeURIComponent(s); }catch(e){ return null; }
+}
+
+/* ROT helpers */
+function rotN(s,n){
+  return s.replace(/[A-Za-z0-9]/g, c => {
+    const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    const i = alpha.indexOf(c);
+    if(i===-1) return c;
+    return alpha[(i + n + alpha.length) % alpha.length];
+  });
+}
+
+/* ---------------- Decoders / transforms ---------------- */
+
+/* rebuild simple string.char(...) */
+function rebuildStringCharSimple(text){
+  return text.replace(/string\\.char\\s*\\(\\s*([0-9,\\s]{1,3000})\\s*\\)/gi, (_,inside)=>{
+    try{
+      const nums = inside.split(',').map(x=>parseInt(x.trim())).filter(n=>!isNaN(n)&&n>=0&&n<=255);
+      if(nums.length) return nums.map(n=>String.fromCharCode(n)).join('');
+    }catch(e){}
+    return _;
+  });
+}
+
+/* concatenated string.char like string.char(...)..string.char(...) */
+function rebuildConcatenatedStringChar(text){
+  const re = /(string\\.char\\s*\\(\\s*[0-9,\\s]{1,3000}\\s*\\))(?:\\s*\\.\\.\\s*(string\\.char\\s*\\(\\s*[0-9,\\s]{1,3000}\\s*\\)))+/gi;
+  return text.replace(re, match=>{
+    const nums = (match.match(/[0-9]{1,3}/g)||[]).map(n=>parseInt(n,10)).filter(n=>!isNaN(n)&&n>=0&&n<=255);
+    if(nums.length) return nums.map(i=>String.fromCharCode(i)).join('');
+    return match;
+  });
+}
+
+/* octal \123 */
+function unescapeOctalOnce(text){
+  return text.replace(/\\\\([0-7]{1,3})/g, (_,oct)=>{
+    const v = parseInt(oct,8);
+    if(!isNaN(v) && v>=32 && v<127) return String.fromCharCode(v);
+    return '\\'+oct;
+  });
+}
+
+/* \xHH and \uHHHH */
+function unescapeHexUnicodeOnce(text){
+  let out = text.replace(/\\\\x([0-9a-fA-F]{2})/g, (_,h)=>String.fromCharCode(parseInt(h,16)));
+  out = out.replace(/\\\\u([0-9a-fA-F]{4})/g, (_,h)=>String.fromCharCode(parseInt(h,16)));
+  return out;
+}
+
+/* find base64 candidates and decode printable-ish ones */
+function findBase64Decodes(text){
+  const set = new Set(); const re = /([A-Za-z0-9+/]{12,}={0,2})/g;
+  let m; while((m=re.exec(text))!==null){ set.add(m[1]); if(re.lastIndex===m.index) re.lastIndex++; if(set.size>800) break; }
+  const out = {};
+  Array.from(set).slice(0,400).forEach(s=>{
+    const d = safeAtob(s);
+    if(d){
+      let printable=0; for(let i=0;i<d.length;i++){ const c=d.charCodeAt(i); if(c>=32&&c<127) printable++; }
+      if(d.length && printable/d.length >= 0.45) out[s]=d;
+    }
+  });
+  return out;
+}
+
+/* find hex-like decodes */
+function findHexDecodes(text){
+  const re = /0x[0-9a-fA-F]{6,}|[0-9a-fA-F]{8,}/g;
+  const set = new Set(); let m;
+  while((m=re.exec(text))!==null){ set.add(m[0]); if(re.lastIndex===m.index) re.lastIndex++; if(set.size>300) break; }
+  const out = {};
+  Array.from(set).slice(0,200).forEach(h=>{
+    try{
+      let hex = h.replace(/0x/ig,'').replace(/[^0-9a-fA-F]/g,''); if(hex.length%2) hex='0'+hex;
+      let s=''; let printable=0;
+      for(let i=0;i<hex.length;i+=2){ const c=parseInt(hex.substr(i,2),16); s+=String.fromCharCode(c); if(c>=32&&c<127) printable++; }
+      if(s.length && printable/s.length >= 0.5) out[h]=s;
+    }catch(e){}
+  });
+  return out;
+}
+
+/* single-byte XOR brute on small blobs (string input) -> top candidates */
+function xorBruteSingleByte(blob){
+  const results=[];
+  for(let k=1;k<256;k++){
+    let out=''; let printable=0;
+    for(let i=0;i<blob.length;i++){
+      const v = blob.charCodeAt(i) ^ k;
+      out += String.fromCharCode(v);
+      if(v>=32 && v<127) printable++;
+    }
+    const score = printable / Math.max(1, blob.length);
+    if(score > 0.65) results.push({key:k,score,decoded:out});
+  }
+  results.sort((a,b)=>b.score-a.score);
+  return results.slice(0,6);
+}
+
+/* Replace decoded in load/loadstring occurrences */
+function replaceDecodedInLoad(text, decodedMap){
+  let out = text;
+  for(const k in decodedMap){
+    const safe = k.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&');
+    const re = new RegExp('(loadstring|load)\\s*\\(\\s*([\"\\\'])'+safe+'\\2\\s*\\)', 'g');
+    out = out.replace(re, (m,fn,quote) => fn + '(' + quote + decodedMap[k] + quote + ')');
+  }
+  return out;
+}
+
+/* detect known protectors signature (non-bypass) */
+function detectProtectors(text){
+  const sigs = [];
+  const lower = text.toLowerCase();
+  if(lower.includes('moonsec') || lower.includes('moon sec')) sigs.push('MoonSec (signature found)');
+  if(lower.includes('luau') && lower.includes('obfusc')) sigs.push('Luau obfuscator signature');
+  if(lower.includes('protect') && lower.includes('obfus')) sigs.push('Generic protector signature keywords');
+  return sigs;
+}
+
+/* ---------------- Pipeline ---------------- */
+function deobPipeline(origText, opts, log){
+  let text = origText;
+  let pass = 0; const maxPass = opts.iterative ? 6 : 1;
+  while(pass < maxPass){
+    pass++; log('-- pass '+(pass)+' start (len '+text.length+')');
+    let changed=false;
+
+    // string.char
+    if(opts.char){
+      const t = rebuildStringCharSimple(text);
+      if(t !== text){ log('applied string.char() -> replaced'); text = t; changed=true; }
+    }
+    // concatenated string.char
+    if(opts.concatChar){
+      const t2 = rebuildConcatenatedStringChar(text);
+      if(t2 !== text){ log('applied concatenated string.char() -> replaced'); text = t2; changed=true; }
+    }
+    // octal
+    if(opts.octal){
+      const t3 = unescapeOctalOnce(text);
+      if(t3 !== text){ log('applied octal \\nnn unescape'); text = t3; changed=true; }
+    }
+    // hex/unicode escapes
+    if(opts.unicode){
+      const t4 = unescapeHexUnicodeOnce(text);
+      if(t4 !== text){ log('applied \\x / \\u unescape'); text = t4; changed=true; }
+    }
+    // base64
+    if(opts.b64){
+      const decs = findBase64Decodes(text);
+      const cnt = Object.keys(decs).length;
+      if(cnt>0){
+        log('found base64-like candidates: '+cnt);
+        if(opts.replaceLoad){
+          text = replaceDecodedInLoad(text, decs);
+          log('replaced base64 inside load/loadstring (where matched)');
+          changed=true;
+        } else {
+          log('found base64 tokens (not replacing inside load)');
+        }
+      }
+    }
+    // url decode
+    if(opts.urlDecode){
+      // find %.. sequences
+      if(/%[0-9A-Fa-f]{2}/.test(text)){
+        const dec = safeUrlDecode(text);
+        if(dec && dec !== text){ log('applied URL decode (attempt)'); text = dec; changed=true; }
+      }
+    }
+    // rot13/47 attempts
+    if(opts.rot){
+      // quick heuristic: if many letters but unreadable, try rot13 and rot47 and see printable ratio
+      const r13 = text.replace(/[A-Za-z]/g, c=>{ const A='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'; const i=A.indexOf(c); return i==-1?c:A[(i+13)%26 + (i>=26?26:0)]; });
+      const r47 = text.split('').map(ch => {
+        const code = ch.charCodeAt(0);
+        if(code>=33 && code<=126) return String.fromCharCode(33 + ((code-33+47)%94));
+        return ch;
+      }).join('');
+      // choose if result looks more printable (simple heuristic)
+      function printableRatio(s){ let p=0; for(let i=0;i<s.length;i++){ const c=s.charCodeAt(i); if(c>=32 && c<127) p++; } return p/s.length; }
+      if(printableRatio(r13) > printableRatio(text)+0.15){ log('ROT13 looks more printable; applied ROT13'); text = r13; changed=true; }
+      else if(printableRatio(r47) > printableRatio(text)+0.15){ log('ROT47 looks more printable; applied ROT47'); text = r47; changed=true; }
+    }
+    // hex blobs
+    if(opts.hex){
+      const hd = findHexDecodes(text);
+      const cnt = Object.keys(hd).length;
+      if(cnt>0){
+        log('found hex-like decodes: '+cnt);
+        for(const k in hd){ if(text.includes(k)){ text = text.replace(new RegExp(k.replace(/[.*+?^${}()|[\\]\\\\]/g,'\\\\$&'),'g'), hd[k]); changed=true; } }
+        if(changed) log('replaced some hex-like tokens');
+      }
+    }
+    // XOR brute small blobs
+    if(opts.xor){
+      // build small candidate list: small base64 decodes + short printable substrings
+      const candidates = [];
+      const b64s = Object.values(findBase64Decodes(text));
+      b64s.forEach(v=>{ if(v.length<=180) candidates.push(v); });
+      const prints = (text.match(/[\\x20-\\x7E]{8,160}/g)||[]).slice(0,200);
+      prints.forEach(p=>{ if(p.length<=180) candidates.push(p); });
+      let anyXor=false;
+      for(const c of candidates.slice(0,40)){
+        const res = xorBruteSingleByte(c);
+        if(res && res.length){
+          log('XOR candidates (sample) for blob len '+c.length+': key=0x'+res[0].key.toString(16).padStart(2,'0')+' score='+res[0].score.toFixed(3));
+          anyXor=true;
+        }
+      }
+      if(anyXor) log('XOR brute attempted on some small blobs (no automatic replace)');
+    }
+
+    log('-- pass '+pass+' end (len '+text.length+')');
+    if(!changed) break;
+  }
+  return text;
+}
+
+/* ---------------- UI wiring ---------------- */
+
+el('fileInput').addEventListener('change', async e=>{
+  const f = e.target.files[0]; if(!f) return;
+  const txt = await f.text(); el('input').value = txt; alert('File loaded to textbox');
+});
+
+el('fetchBtn').addEventListener('click', async ()=>{
+  const url = el('rawUrl').value.trim(); if(!url){ alert('Ilagay raw URL'); return; }
+  try{
+    if(!(url.includes('raw.githubusercontent.com')||url.includes('gist.githubusercontent.com'))){
+      if(!confirm('Di raw.githubusercontent URL. Sigurado?')) return;
+    }
+    const r = await fetch(url); if(!r.ok) throw new Error('Fetch failed: '+r.status);
+    el('input').value = await r.text(); alert('Fetched file content');
+  }catch(err){ alert('Error: '+err.message); }
+});
+
+function newLogCard(){
+  const d = document.createElement('div'); d.className='card';
+  const pre = document.createElement('pre'); pre.id='logPre'; pre.textContent=''; d.appendChild(pre);
+  return {card:d,pre:pre};
+}
+
+el('deobBtn').addEventListener('click', ()=>{
+  const src = el('input').value || ''; if(!src.trim()){ alert('I-paste muna ang code.'); return; }
+  const opts = {
+    char: el('optChar').checked,
+    concatChar: el('optConcatChar').checked,
+    octal: el('optOctal').checked,
+    unicode: el('optUnicode').checked,
+    b64: el('optB64').checked,
+    hex: el('optHex').checked,
+    urlDecode: el('optUrlDecode').checked,
+    rot: el('optRot').checked,
+    xor: el('optXor').checked,
+    replaceLoad: el('optReplaceLoad').checked,
+    iterative: el('optIter').checked
+  };
+  const results = el('results'); results.innerHTML = '';
+  const lg = newLogCard(); results.appendChild(lg.card);
+  const log = s=> lg.pre.textContent += s + '\\n';
+  setTimeout(()=>{
+    try{
+      log('Starting pipeline...');
+      // detect protectors signatures (informational)
+      const sigs = detectProtectors(src);
+      if(sigs.length) log('Protector signatures found: ' + sigs.join('; ') + '  (note: tool will not bypass them)');
+      const out = deobPipeline(src, opts, log);
+      // show transformed preview
+      const resCard = document.createElement('div'); resCard.className='card';
+      const summary = document.createElement('div'); summary.innerHTML = '<strong>Transformed Preview</strong><div class="muted">Length: '+out.length+' chars</div>';
+      const preOut = document.createElement('pre'); preOut.textContent = out;
+      resCard.appendChild(summary); resCard.appendChild(preOut);
+      results.appendChild(resCard);
+
+      // quick scanner of items
+      const scan = document.createElement('div'); scan.className='card';
+      scan.innerHTML = '<strong>Detected items</strong>';
+      // functions
+      const funcMatches = [];
+      const reFunc = /\\bfunction\\s+([A-Za-z0-9_:\\.]+)/g;
+      let m; while((m=reFunc.exec(out))!==null){ funcMatches.push(m[1]); if(reFunc.lastIndex===m.index) reFunc.lastIndex++; if(funcMatches.length>500) break; }
+      // strings (simple)
+      const stringMatches = (out.match(/(["\\'])(?:(?=(\\\\?))\\2.)*?\\1/g)||[]).slice(0,200);
+      // suspicious patterns
+      const suspicious = ['loadstring','load','syn.request','HttpService','game:GetService','getfenv','setfenv','hookfunction','require','writefile','readfile','http.request','http.post','webhook','token','setclipboard','clipboard','rconsole','rconsoleprint'];
+      const sfound = suspicious.filter(k=> out.toLowerCase().includes(k.toLowerCase()));
+      let hits = '';
+      if(funcMatches.length) hits += '<div class="muted"><b>Functions:</b> '+escapeHtml(Array.from(new Set(funcMatches)).slice(0,200).join(', '))+'</div>';
+      if(stringMatches.length) hits += '<div class="muted"><b>Strings (sample):</b> '+escapeHtml(stringMatches.slice(0,60).join(', '))+'</div>';
+      if(sfound.length) hits += '<div class="warn"><b>Possible risky patterns:</b> '+escapeHtml(sfound.join(', '))+'</div>';
+      if(!hits) hits = '<div class="ok">No obvious items found by quick scan.</div>';
+      scan.innerHTML += hits;
+      results.appendChild(scan);
+
+      window.latestTransformed = out;
+      log('Done. Use Copy / Download buttons below.');
+    }catch(e){
+      lg.pre.textContent += 'Error: ' + e.message;
+      alert('Error during processing: '+e.message);
+    }
+  },50);
+});
+
+el('clearBtn').addEventListener('click', ()=>{ el('input').value=''; el('results').innerHTML=''; window.latestTransformed=''; });
+el('copyBtn').addEventListener('click', ()=>{ if(window.latestTransformed){ navigator.clipboard.writeText(window.latestTransformed).then(()=>alert('Copied result.')); } else alert('Walang result.'); });
+el('dlBtn').addEventListener('click', ()=>{ if(window.latestTransformed) downloadFile('deobfuscated.txt', window.latestTransformed); else alert('Walang result.'); });
+
+/* quick tests */
+el('testA').addEventListener('click', ()=>{ el('input').value = 'print(\"start\")\\nloadstring(\"aGVsbG8gd29ybGQ=\")()\\nprint(\"end\")'; });
+el('testB').addEventListener('click', ()=>{ el('input').value = 'local s = string.char(72,101,108,108,111)\\nprint(s)'; });
+el('testC').addEventListener('click', ()=>{ el('input').value = 'local a = \"\\\\110\\\\097\\\\109\\\\101\"\\nprint(a)'; });
+</script>
+</body>
+</html>
